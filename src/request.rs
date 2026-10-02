@@ -90,6 +90,10 @@ impl MessagesRequest {
         self
     }
 
+    /// Sets `output_config.effort`. Not every model accepts it: Claude Haiku 4.5 and
+    /// Claude Sonnet 4.5 reject the parameter (use `ThinkingConfig::Enabled` there),
+    /// Claude Opus 4.5 takes only `Low`/`Medium`/`High`, and Claude Opus 4.6 / Sonnet 4.6
+    /// do not take `Xhigh`. The SDK does not check this; the API returns an error.
     pub fn effort(mut self, effort: Effort) -> Self {
         self.output_config.get_or_insert_with(OutputConfig::default).effort = Some(effort);
         self

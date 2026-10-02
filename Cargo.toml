@@ -1,0 +1,19 @@
+[package]
+name = "claude-sdk"
+description = "A small typed client for Anthropic's Messages API: requests, citations, prompt caching, refusal fallbacks, retries and streaming."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+repository = "https://github.com/aoprisan/rust-claude-sdk"
+publish = false
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }

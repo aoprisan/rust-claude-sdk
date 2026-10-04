@@ -270,6 +270,22 @@ impl ContentBlockParam {
         }
     }
 
+    /// A document uploaded with the Files API (PDF or plain text).
+    pub fn file_document(file_id: impl Into<String>) -> ContentBlockParam {
+        ContentBlockParam::Document {
+            source: DocumentSource::File { file_id: file_id.into() },
+            title: None,
+            context: None,
+            citations: None,
+            cache_control: None,
+        }
+    }
+
+    /// An image uploaded with the Files API.
+    pub fn file_image(file_id: impl Into<String>) -> ContentBlockParam {
+        ContentBlockParam::Image { source: ImageSource::File { file_id: file_id.into() }, cache_control: None }
+    }
+
     pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> ContentBlockParam {
         ContentBlockParam::ToolResult {
             tool_use_id: tool_use_id.into(),
@@ -438,15 +454,44 @@ pub struct Tool {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// Loaded only when a tool search finds it (see `ToolSearchTool`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
 
-/// A custom tool, or any other tool definition (server tools such as web search) as raw JSON.
+impl Tool {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: Value) -> Tool {
+        Tool { name: name.into(), description: description.into(), input_schema, strict: None, defer_loading: None, cache_control: None }
+    }
+
+    /// Inputs always validate against the schema (which needs `additionalProperties: false`).
+    pub fn strict(mut self) -> Self {
+        self.strict = Some(true);
+        self
+    }
+
+    pub fn deferred(mut self) -> Self {
+        self.defer_loading = Some(true);
+        self
+    }
+
+    pub fn with_cache_control(mut self, cc: CacheControl) -> Self {
+        self.cache_control = Some(cc);
+        self
+    }
+}
+
+/// A tool definition: a custom tool, a server tool Anthropic runs, or anything else as raw JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ToolDefinition {
     Custom(Tool),
+    WebSearch(WebSearchTool),
+    WebFetch(WebFetchTool),
+    CodeExecution(CodeExecutionTool),
+    ToolSearch(ToolSearchTool),
     Raw(Value),
 }
 
@@ -456,9 +501,254 @@ impl From<Tool> for ToolDefinition {
     }
 }
 
+impl From<WebSearchTool> for ToolDefinition {
+    fn from(t: WebSearchTool) -> ToolDefinition {
+        ToolDefinition::WebSearch(t)
+    }
+}
+
+impl From<WebFetchTool> for ToolDefinition {
+    fn from(t: WebFetchTool) -> ToolDefinition {
+        ToolDefinition::WebFetch(t)
+    }
+}
+
+impl From<CodeExecutionTool> for ToolDefinition {
+    fn from(t: CodeExecutionTool) -> ToolDefinition {
+        ToolDefinition::CodeExecution(t)
+    }
+}
+
+impl From<ToolSearchTool> for ToolDefinition {
+    fn from(t: ToolSearchTool) -> ToolDefinition {
+        ToolDefinition::ToolSearch(t)
+    }
+}
+
 impl From<Value> for ToolDefinition {
     fn from(v: Value) -> ToolDefinition {
         ToolDefinition::Raw(v)
+    }
+}
+
+/// Server-side web search. Results come back as `ContentBlock::WebSearchToolResult` blocks
+/// and cited text carries `Citation::WebSearchResultLocation`. A failed search is an error
+/// object inside the result block, not an API error.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WebSearchTool {
+    /// The tool version, e.g. `web_search_20260209`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// Use `allowed_domains` or `blocked_domains`, not both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<UserLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl WebSearchTool {
+    /// The version with dynamic filtering (Claude Opus 4.6, Claude Sonnet 4.6 and later).
+    /// Do not also declare `CodeExecutionTool`: it runs code on its own.
+    pub fn new() -> WebSearchTool {
+        WebSearchTool::version("web_search_20260209")
+    }
+
+    /// The basic version, for older models and Vertex AI.
+    pub fn basic() -> WebSearchTool {
+        WebSearchTool::version("web_search_20250305")
+    }
+
+    pub fn version(kind: impl Into<String>) -> WebSearchTool {
+        WebSearchTool {
+            kind: kind.into(),
+            name: "web_search".into(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            user_location: None,
+            cache_control: None,
+        }
+    }
+
+    pub fn max_uses(mut self, n: u32) -> Self {
+        self.max_uses = Some(n);
+        self
+    }
+
+    pub fn allowed_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_domains = Some(domains.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn blocked_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.blocked_domains = Some(domains.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn user_location(mut self, location: UserLocation) -> Self {
+        self.user_location = Some(location);
+        self
+    }
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        WebSearchTool::new()
+    }
+}
+
+/// Where the user roughly is, to localise search results; serialised with `"type": "approximate"`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(tag = "type", rename = "approximate")]
+pub struct UserLocation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// ISO 3166-1 alpha-2, e.g. `RO`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// IANA time zone, e.g. `Europe/Bucharest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// Server-side fetch of a URL already present in the conversation. The page comes back as
+/// a `ContentBlock::WebFetchToolResult` block.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WebFetchTool {
+    /// The tool version, e.g. `web_fetch_20260209`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    /// Lets the answer cite the fetched pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<CitationsConfig>,
+    /// Truncates long pages to about this many tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_content_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl WebFetchTool {
+    /// The version with dynamic filtering (Claude Opus 4.6, Claude Sonnet 4.6 and later).
+    pub fn new() -> WebFetchTool {
+        WebFetchTool::version("web_fetch_20260209")
+    }
+
+    /// The basic version, for older models.
+    pub fn basic() -> WebFetchTool {
+        WebFetchTool::version("web_fetch_20250910")
+    }
+
+    pub fn version(kind: impl Into<String>) -> WebFetchTool {
+        WebFetchTool {
+            kind: kind.into(),
+            name: "web_fetch".into(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            max_content_tokens: None,
+            cache_control: None,
+        }
+    }
+
+    pub fn max_uses(mut self, n: u32) -> Self {
+        self.max_uses = Some(n);
+        self
+    }
+
+    pub fn allowed_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_domains = Some(domains.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn blocked_domains(mut self, domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.blocked_domains = Some(domains.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_citations(mut self) -> Self {
+        self.citations = Some(CitationsConfig { enabled: true });
+        self
+    }
+
+    pub fn max_content_tokens(mut self, n: u32) -> Self {
+        self.max_content_tokens = Some(n);
+        self
+    }
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        WebFetchTool::new()
+    }
+}
+
+/// Server-side code execution in a sandbox. Output comes back as
+/// `ContentBlock::BashCodeExecutionToolResult` and `TextEditorCodeExecutionToolResult` blocks;
+/// files it writes can be downloaded with `Client::download_file`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CodeExecutionTool {
+    /// The tool version, e.g. `code_execution_20260521`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl CodeExecutionTool {
+    pub fn new() -> CodeExecutionTool {
+        CodeExecutionTool::version("code_execution_20260521")
+    }
+
+    /// Another version, e.g. `code_execution_20260120` for programmatic tool calling.
+    pub fn version(kind: impl Into<String>) -> CodeExecutionTool {
+        CodeExecutionTool { kind: kind.into(), name: "code_execution".into(), cache_control: None }
+    }
+}
+
+impl Default for CodeExecutionTool {
+    fn default() -> Self {
+        CodeExecutionTool::new()
+    }
+}
+
+/// Server-side search over the request's deferred tools (`Tool::deferred`): only the tools
+/// it finds are loaded. Keep at least one tool, this one included, not deferred.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolSearchTool {
+    /// `tool_search_tool_regex_20251119` or `tool_search_tool_bm25_20251119`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+}
+
+impl ToolSearchTool {
+    /// The model searches with regular expressions.
+    pub fn regex() -> ToolSearchTool {
+        ToolSearchTool { kind: "tool_search_tool_regex_20251119".into(), name: "tool_search_tool_regex".into() }
+    }
+
+    /// The model searches with natural-language queries.
+    pub fn bm25() -> ToolSearchTool {
+        ToolSearchTool { kind: "tool_search_tool_bm25_20251119".into(), name: "tool_search_tool_bm25".into() }
     }
 }
 

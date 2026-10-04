@@ -3,6 +3,9 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::multipart::{Form, Part};
+use reqwest::{Method, Url};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
@@ -131,6 +134,23 @@ struct ErrorEnvelope {
     request_id: Option<String>,
 }
 
+/// What a request carries.
+#[derive(Clone, Copy)]
+pub(crate) enum Payload<'a> {
+    Empty,
+    Json(&'a [u8]),
+    /// A `multipart/form-data` body with one `file` field.
+    File {
+        filename: &'a str,
+        mime_type: &'a str,
+        data: &'a [u8],
+    },
+}
+
+pub(crate) fn to_json(body: &impl Serialize) -> Result<Vec<u8>, Error> {
+    serde_json::to_vec(body).map_err(|e| Error::Config(e.to_string()))
+}
+
 /// A failed attempt, and whether it may be retried after `wait`.
 struct Failure {
     error: Error,
@@ -160,14 +180,8 @@ impl Client {
     pub async fn create_with(&self, request: &MessagesRequest, options: CallOptions) -> Result<Message, Error> {
         let mut body = request.clone();
         body.stream = None;
-        let betas = request.beta_header_values();
-        self.retrying(options, || async {
-            let res = self.send("/v1/messages", &body, &betas, options).await?;
-            let read = res.bytes();
-            let bytes = within(self.attempt_end(options), read).await?.map_err(|e| transport(&e))?;
-            serde_json::from_slice::<Message>(&bytes).map_err(|e| Failure { error: Error::Decode(e.to_string()), retry: false, wait: None })
-        })
-        .await
+        let json = to_json(&body)?;
+        self.call(Method::POST, &["v1", "messages"], &[], Payload::Json(&json), &request.beta_header_values(), options).await
     }
 
     /// `POST /v1/messages` with `"stream": true`. Retries cover opening the stream only;
@@ -179,9 +193,11 @@ impl Client {
     pub async fn stream_with(&self, request: &MessagesRequest, options: CallOptions) -> Result<MessageStream, Error> {
         let mut body = request.clone();
         body.stream = Some(true);
+        let json = to_json(&body)?;
+        let url = self.url(&["v1", "messages"])?;
         let betas = request.beta_header_values();
         self.retrying(options, || async {
-            let res = self.send("/v1/messages", &body, &betas, options).await?;
+            let res = self.send(Method::POST, url.clone(), &[], Payload::Json(&json), &betas, options).await?;
             let request_id = header(res.headers(), "request-id");
             Ok(MessageStream::new(res, options.deadline, request_id))
         })
@@ -198,18 +214,56 @@ impl Client {
             tool_choice: &request.tool_choice,
             thinking: &request.thinking,
         };
-        let options = CallOptions::default();
-        let betas = request.betas.clone();
+        let json = to_json(&body)?;
+        let res: CountTokensResponse =
+            self.call(Method::POST, &["v1", "messages", "count_tokens"], &[], Payload::Json(&json), &request.betas, CallOptions::default()).await?;
+        Ok(res.input_tokens)
+    }
+
+    /// One request with retries, its body decoded as JSON.
+    pub(crate) async fn call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &[&str],
+        query: &[(&str, String)],
+        payload: Payload<'_>,
+        betas: &[String],
+        options: CallOptions,
+    ) -> Result<T, Error> {
+        let bytes = self.call_bytes(method, path, query, payload, betas, options).await?;
+        serde_json::from_slice::<T>(&bytes).map_err(|e| Error::Decode(e.to_string()))
+    }
+
+    /// One request with retries; the whole body.
+    pub(crate) async fn call_bytes(
+        &self,
+        method: Method,
+        path: &[&str],
+        query: &[(&str, String)],
+        payload: Payload<'_>,
+        betas: &[String],
+        options: CallOptions,
+    ) -> Result<Vec<u8>, Error> {
+        let url = self.url(path)?;
         self.retrying(options, || async {
-            let res = self.send("/v1/messages/count_tokens", &body, &betas, options).await?;
+            let res = self.send(method.clone(), url.clone(), query, payload, betas, options).await?;
             let bytes = within(self.attempt_end(options), res.bytes()).await?.map_err(|e| transport(&e))?;
-            serde_json::from_slice::<CountTokensResponse>(&bytes).map(|r| r.input_tokens).map_err(|e| Failure {
-                error: Error::Decode(e.to_string()),
-                retry: false,
-                wait: None,
-            })
+            Ok(bytes.to_vec())
         })
         .await
+    }
+
+    /// One request with retries; the open response, for bodies read piece by piece.
+    pub(crate) async fn call_response(&self, method: Method, path: &[&str], betas: &[String], options: CallOptions) -> Result<reqwest::Response, Error> {
+        let url = self.url(path)?;
+        self.retrying(options, || self.send(method.clone(), url.clone(), &[], Payload::Empty, betas, options)).await
+    }
+
+    /// `base_url` with `segments` appended, each percent-encoded (ids cannot escape their segment).
+    fn url(&self, segments: &[&str]) -> Result<Url, Error> {
+        let mut url = Url::parse(&self.config.base_url).map_err(|e| Error::Config(format!("base_url: {e}")))?;
+        url.path_segments_mut().map_err(|_| Error::Config("base_url cannot have a path".into()))?.pop_if_empty().extend(segments);
+        Ok(url)
     }
 
     async fn retrying<T, F, Fut>(&self, options: CallOptions, attempt: F) -> Result<T, Error>
@@ -245,9 +299,19 @@ impl Client {
         options.deadline.map_or(end, |d| d.min(end))
     }
 
-    async fn send(&self, path: &str, body: &impl Serialize, betas: &[String], options: CallOptions) -> Result<reqwest::Response, Failure> {
-        let url = format!("{}{path}", self.config.base_url.trim_end_matches('/'));
-        let mut req = self.http.post(url).header("anthropic-version", API_VERSION).header(CONTENT_TYPE, "application/json");
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        payload: Payload<'_>,
+        betas: &[String],
+        options: CallOptions,
+    ) -> Result<reqwest::Response, Failure> {
+        let mut req = self.http.request(method, url).header("anthropic-version", API_VERSION);
+        if !query.is_empty() {
+            req = req.query(query);
+        }
         req = match &self.config.credential {
             Credential::ApiKey(k) => req.header("x-api-key", k),
             Credential::Bearer(t) => req.bearer_auth(t),
@@ -262,8 +326,19 @@ impl Client {
         if !all.is_empty() {
             req = req.header("anthropic-beta", all.join(","));
         }
-        let body = serde_json::to_vec(body).map_err(|e| Failure { error: Error::Config(e.to_string()), retry: false, wait: None })?;
-        let res = within(self.attempt_end(options), req.body(body).send()).await?.map_err(|e| transport(&e))?;
+        req = match payload {
+            Payload::Empty => req,
+            Payload::Json(body) => req.header(CONTENT_TYPE, "application/json").body(body.to_vec()),
+            Payload::File { filename, mime_type, data } => {
+                let part = Part::bytes(data.to_vec()).file_name(filename.to_string()).mime_str(mime_type).map_err(|e| Failure {
+                    error: Error::Config(format!("mime type: {e}")),
+                    retry: false,
+                    wait: None,
+                })?;
+                req.multipart(Form::new().part("file", part))
+            }
+        };
+        let res = within(self.attempt_end(options), req.send()).await?.map_err(|e| transport(&e))?;
         let status = res.status().as_u16();
         if res.status().is_success() {
             return Ok(res);

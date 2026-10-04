@@ -219,7 +219,9 @@ impl Accumulator {
             }
             StreamEvent::ContentBlockStop { index } => {
                 let Some(json) = self.partial_json.remove(index) else { return };
-                if let Some(ContentBlock::ToolUse { input, .. }) = self.message.as_mut().and_then(|m| m.content.get_mut(*index)) {
+                if let Some(ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. }) =
+                    self.message.as_mut().and_then(|m| m.content.get_mut(*index))
+                {
                     // An empty input streams as no delta, or as an empty string.
                     *input = if json.trim().is_empty() { Value::Object(Map::new()) } else { serde_json::from_str(&json).unwrap_or(Value::String(json)) };
                 }

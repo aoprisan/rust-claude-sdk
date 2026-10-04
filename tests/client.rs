@@ -1,17 +1,18 @@
-//! The client against a local stand-in for the Messages API: request shape and headers,
-//! citations, unknown block types, retries, deadlines, streaming and token counting.
+//! The client against a local stand-in for the API: request shape and headers, citations,
+//! unknown block types, server tools, retries, deadlines, streaming, token counting,
+//! batches, files and models.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
 use axum::Router;
 use rust_claude_sdk::{
-    CacheControl, CallOptions, Citation, Client, ClientConfig, ContentBlock, ContentBlockParam, Credential, Delta, Effort, Error, Fallbacks, MessageParam,
-    MessagesRequest, StopReason, StreamEvent, ThinkingConfig, ThinkingDisplay, Tool,
+    BatchOutcome, BatchRequest, CacheControl, CallOptions, Citation, Client, ClientConfig, CodeExecutionContent, CodeExecutionTool, ContentBlock,
+    ContentBlockParam, Credential, Delta, Effort, Error, Fallbacks, ListParams, MessageParam, MessagesRequest, ProcessingStatus, StopReason, StreamEvent,
+    ThinkingConfig, ThinkingDisplay, Tool, ToolSearchTool, UserLocation, WebFetchContent, WebFetchTool, WebSearchContent, WebSearchTool,
 };
 use serde_json::{json, Value};
 
@@ -37,11 +38,14 @@ struct Server {
     replies: Arc<Vec<Reply>>,
     hits: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// Method, path with query, and raw body of each request.
+    calls: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
-async fn handle(State(s): State<Server>, headers: HeaderMap, body: String) -> Response {
+async fn handle(State(s): State<Server>, method: Method, uri: Uri, headers: HeaderMap, body: String) -> Response {
     let n = s.hits.fetch_add(1, Ordering::SeqCst);
     s.seen.lock().unwrap().push((headers, serde_json::from_str(&body).unwrap_or(Value::Null)));
+    s.calls.lock().unwrap().push((method.to_string(), uri.to_string(), body));
     let r = s.replies.get(n).or(s.replies.last()).unwrap().clone();
     tokio::time::sleep(r.delay).await;
     let mut res = (StatusCode::from_u16(r.status).unwrap(), r.body).into_response();
@@ -52,8 +56,8 @@ async fn handle(State(s): State<Server>, headers: HeaderMap, body: String) -> Re
 }
 
 async fn serve(replies: Vec<Reply>) -> (String, Server) {
-    let server = Server { replies: Arc::new(replies), hits: Arc::default(), seen: Arc::default() };
-    let app = Router::new().route("/v1/messages", post(handle)).route("/v1/messages/count_tokens", post(handle)).with_state(server.clone());
+    let server = Server { replies: Arc::new(replies), hits: Arc::default(), seen: Arc::default(), calls: Arc::default() };
+    let app = Router::new().fallback(handle).with_state(server.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -77,7 +81,7 @@ const CITED: &str = r#"{
        "document_title": "Ghid CI", "start_char_index": 0, "end_char_index": 28},
       {"type": "search_result_location", "cited_text": "30 de zile", "source": "https://hub.mai.gov.ro", "search_result_index": 0}
     ]},
-    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "ci"}},
+    {"type": "brand_new_block", "id": "x_1", "payload": {"query": "ci"}},
     {"type": "text", "text": "."}
   ],
   "stop_reason": "end_turn", "stop_sequence": null,
@@ -141,7 +145,7 @@ async fn decodes_citations_and_keeps_unknown_blocks_for_echoing() {
 
     // The unknown block survives a round trip unchanged, so an assistant turn echoes intact.
     let ContentBlock::Other(raw) = &m.content[2] else { panic!("{:?}", m.content[2]) };
-    assert_eq!(raw["type"], "server_tool_use");
+    assert_eq!(raw["type"], "brand_new_block");
     let echoed: Vec<ContentBlockParam> = m.content.iter().cloned().map(ContentBlockParam::from).collect();
     let v = serde_json::to_value(MessageParam::assistant(echoed)).unwrap();
     assert_eq!(v["content"][2], serde_json::from_str::<Value>(CITED).unwrap()["content"][2]);
@@ -214,13 +218,15 @@ async fn fallback_list_tools_thinking_and_bearer_tokens() {
         .user("salut")
         .thinking(ThinkingConfig::Adaptive { display: Some(ThinkingDisplay::Summarized) })
         .fallbacks(Fallbacks::Models(vec![rust_claude_sdk::FallbackModel { model: "claude-opus-4-8".into(), max_tokens: None }]))
-        .tool(Tool {
-            name: "cui".into(),
-            description: "Checks a CUI".into(),
-            input_schema: json!({"type": "object", "properties": {"cui": {"type": "string"}}, "required": ["cui"], "additionalProperties": false}),
-            strict: Some(true),
-            cache_control: Some(CacheControl::one_hour()),
-        })
+        .tool(
+            Tool::new(
+                "cui",
+                "Checks a CUI",
+                json!({"type": "object", "properties": {"cui": {"type": "string"}}, "required": ["cui"], "additionalProperties": false}),
+            )
+            .strict()
+            .with_cache_control(CacheControl::one_hour()),
+        )
         .tool(json!({"type": "web_search_20260209", "name": "web_search"}))
         .beta("server-side-fallback-2026-06-01")
         .param("inference_geo", "eu");
@@ -351,4 +357,283 @@ async fn counts_tokens_with_only_the_prompt_fields() {
     assert!(body.get("max_tokens").is_none());
     assert!(body.get("fallbacks").is_none());
     assert!(body.get("system").is_some());
+}
+
+#[tokio::test]
+async fn server_tools_are_sent_as_documented() {
+    let (url, server) = serve(vec![reply(200, CITED)]).await;
+    let req = MessagesRequest::new("claude-opus-5-5", 4096)
+        .user("Ce acte îmi trebuie pentru pașaport?")
+        .tool(WebSearchTool::new().max_uses(3).allowed_domains(["mai.gov.ro"]).user_location(UserLocation {
+            country: Some("RO".into()),
+            timezone: Some("Europe/Bucharest".into()),
+            ..UserLocation::default()
+        }))
+        .tool(WebFetchTool::new().with_citations().max_content_tokens(20_000))
+        .tool(CodeExecutionTool::new())
+        .tool(ToolSearchTool::bm25())
+        .tool(Tool::new("cui", "Checks a CUI", json!({"type": "object"})).deferred());
+    client(&url, 0).create(&req).await.unwrap();
+
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].1["tools"],
+        json!([
+            {"type": "web_search_20260209", "name": "web_search", "max_uses": 3, "allowed_domains": ["mai.gov.ro"],
+             "user_location": {"type": "approximate", "country": "RO", "timezone": "Europe/Bucharest"}},
+            {"type": "web_fetch_20260209", "name": "web_fetch", "citations": {"enabled": true}, "max_content_tokens": 20000},
+            {"type": "code_execution_20260521", "name": "code_execution"},
+            {"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"},
+            {"name": "cui", "description": "Checks a CUI", "input_schema": {"type": "object"}, "defer_loading": true}
+        ])
+    );
+    assert!(header(&seen[0].0, "anthropic-beta").is_none());
+}
+
+fn searched() -> Value {
+    json!({
+      "id": "msg_w", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+      "content": [
+        {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "acte pasaport"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+          {"type": "web_search_result", "url": "https://pasapoarte.mai.gov.ro/acte", "title": "Acte necesare",
+           "encrypted_content": "EqQBCkY", "page_age": "3 days ago", "brand_new_field": 7}
+        ]},
+        {"type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search", "input": {"query": "taxa"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_2",
+         "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}},
+        {"type": "text", "text": "Buletinul și taxa achitată.", "citations": [
+          {"type": "web_search_result_location", "url": "https://pasapoarte.mai.gov.ro/acte", "title": "Acte necesare",
+           "encrypted_index": "Eo8BCi", "cited_text": "Cartea de identitate și dovada plății taxei."}
+        ]},
+        {"type": "server_tool_use", "id": "srvtoolu_3", "name": "web_fetch", "input": {"url": "https://pasapoarte.mai.gov.ro/acte"}},
+        {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_3", "content": {
+          "type": "web_fetch_result", "url": "https://pasapoarte.mai.gov.ro/acte", "retrieved_at": "2026-10-04T07:00:00Z",
+          "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Acte necesare: ..."},
+                      "title": "Acte necesare", "citations": {"enabled": true}}}},
+        {"type": "server_tool_use", "id": "srvtoolu_4", "name": "bash_code_execution", "input": {"command": "python plot.py"}},
+        {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_4", "content": {
+          "type": "bash_code_execution_result", "stdout": "ok\n", "stderr": "", "return_code": 0,
+          "content": [{"type": "bash_code_execution_output", "file_id": "file_011"}]}},
+        {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_5", "content": {
+          "type": "tool_search_tool_search_result", "tool_references": [{"type": "tool_reference", "tool_name": "cui"}]}}
+      ],
+      "stop_reason": "end_turn", "stop_sequence": null,
+      "usage": {"input_tokens": 5000, "output_tokens": 120, "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1}}
+    })
+}
+
+#[tokio::test]
+async fn server_tool_blocks_decode_typed_and_echo_back_unchanged() {
+    let (url, _) = serve(vec![reply(200, searched().to_string())]).await;
+    let m = client(&url, 0).create(&MessagesRequest::new("claude-opus-5-5", 4096).user("?")).await.unwrap();
+
+    assert!(matches!(&m.content[0], ContentBlock::ServerToolUse { name, input, .. } if name == "web_search" && input["query"] == "acte pasaport"));
+    let results: Vec<_> = m.web_search_results().collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Acte necesare");
+    assert_eq!(results[0].page_age.as_deref(), Some("3 days ago"));
+    let errors: Vec<_> = m.server_tool_errors().collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!((errors[0].0, errors[0].1.error_code.as_str()), ("srvtoolu_2", "max_uses_exceeded"));
+    assert!(matches!(&m.content[3], ContentBlock::WebSearchToolResult { content: WebSearchContent::Error(_), .. }));
+
+    let (span, cite) = m.citations().next().unwrap();
+    assert_eq!(span, "Buletinul și taxa achitată.");
+    assert!(matches!(cite, Citation::WebSearchResultLocation { .. }));
+    assert_eq!(cite.url(), Some("https://pasapoarte.mai.gov.ro/acte"));
+    assert_eq!(cite.cited_text(), Some("Cartea de identitate și dovada plății taxei."));
+    assert_eq!(cite.document_index(), None);
+
+    let ContentBlock::WebFetchToolResult { content: WebFetchContent::Page(page), .. } = &m.content[6] else { panic!("{:?}", m.content[6]) };
+    assert_eq!(page.text(), Some("Acte necesare: ..."));
+    assert_eq!(page.title(), Some("Acte necesare"));
+    let ContentBlock::BashCodeExecutionToolResult { content: CodeExecutionContent::Output(out), .. } = &m.content[8] else { panic!() };
+    assert_eq!((out.stdout.as_str(), out.return_code), ("ok\n", 0));
+    assert_eq!(out.file_ids().collect::<Vec<_>>(), vec!["file_011"]);
+    assert!(matches!(&m.content[9], ContentBlock::ToolSearchToolResult { content: rust_claude_sdk::ToolSearchContent::Found(f), .. }
+        if f.tool_references[0].tool_name == "cui"));
+
+    let usage = m.usage.server_tool_use.as_ref().unwrap();
+    assert_eq!((usage.web_search_requests, usage.web_fetch_requests), (2, 1));
+
+    // Every block, unknown fields included, goes back exactly as received.
+    let echoed: Vec<ContentBlockParam> = m.content.iter().cloned().map(ContentBlockParam::from).collect();
+    assert_eq!(serde_json::to_value(MessageParam::assistant(echoed)).unwrap()["content"], searched()["content"]);
+    assert_eq!(serde_json::to_value(&m.usage).unwrap()["server_tool_use"], searched()["usage"]["server_tool_use"]);
+}
+
+#[tokio::test]
+async fn streamed_server_tool_calls_accumulate_their_input() {
+    let body = sse(&[
+        json!({"type": "message_start", "message": {"id": "m", "type": "message", "role": "assistant", "model": "x", "content": [], "stop_reason": null, "usage": {}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"query\": "}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"taxa\"}"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": searched()["content"][1]}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9, "server_tool_use": {"web_search_requests": 1}}}),
+        json!({"type": "message_stop"}),
+    ]);
+    let (url, _) = serve(vec![reply(200, body)]).await;
+    let m = client(&url, 0).stream(&grounded_request()).await.unwrap().final_message().await.unwrap();
+    assert!(matches!(&m.content[0], ContentBlock::ServerToolUse { input, .. } if *input == json!({"query": "taxa"})));
+    assert_eq!(m.web_search_results().count(), 1);
+    assert_eq!(m.usage.server_tool_use.unwrap().web_search_requests, 1);
+}
+
+fn batch_json(status: &str) -> String {
+    json!({"id": "msgbatch_1", "type": "message_batch", "processing_status": status,
+           "request_counts": {"processing": 0, "succeeded": 1, "errored": 2, "canceled": 1, "expired": 0},
+           "created_at": "2026-10-04T07:00:00Z", "expires_at": "2026-10-05T07:00:00Z", "ended_at": null,
+           "cancel_initiated_at": null, "archived_at": null, "results_url": null})
+    .to_string()
+}
+
+#[tokio::test]
+async fn batches_create_poll_list_cancel_delete() {
+    let page = format!(r#"{{"data": [{}], "has_more": true, "first_id": "msgbatch_1", "last_id": "msgbatch_1"}}"#, batch_json("ended"));
+    let (url, server) = serve(vec![
+        reply(200, batch_json("in_progress")),
+        reply(200, batch_json("ended")),
+        reply(200, page),
+        reply(200, batch_json("canceling")),
+        reply(200, r#"{"id": "msgbatch_1", "type": "message_batch_deleted"}"#),
+    ])
+    .await;
+    let c = client(&url, 0);
+    let req = MessagesRequest::new("claude-opus-5-5", 64).user("a").beta("context-management-2025-06-27");
+    let created = c
+        .create_batch(&[BatchRequest::new("r-1", req.clone()), BatchRequest::new("r-2", MessagesRequest::new("claude-haiku-4-5", 64).user("b"))])
+        .await
+        .unwrap();
+    assert_eq!(created.processing_status, ProcessingStatus::InProgress);
+    assert_eq!(created.request_counts.errored, 2);
+
+    let polled = c.batch("msgbatch_1").await.unwrap();
+    assert!(polled.is_ended());
+    let params = ListParams::limit(1);
+    let listed = c.list_batches(&params).await.unwrap();
+    assert_eq!(listed.data[0].id, "msgbatch_1");
+    assert_eq!(listed.next_params(&params).unwrap().after_id.as_deref(), Some("msgbatch_1"));
+    assert_eq!(c.cancel_batch("msgbatch_1").await.unwrap().processing_status, ProcessingStatus::Canceling);
+    assert_eq!(c.delete_batch("msgbatch_1").await.unwrap().extra["type"], "message_batch_deleted");
+
+    let calls = server.calls.lock().unwrap();
+    let routes: Vec<_> = calls.iter().map(|(m, u, _)| format!("{m} {u}")).collect();
+    assert_eq!(
+        routes,
+        [
+            "POST /v1/messages/batches",
+            "GET /v1/messages/batches/msgbatch_1",
+            "GET /v1/messages/batches?limit=1",
+            "POST /v1/messages/batches/msgbatch_1/cancel",
+            "DELETE /v1/messages/batches/msgbatch_1"
+        ]
+    );
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(header(&seen[0].0, "anthropic-beta"), Some("context-management-2025-06-27"));
+    assert_eq!(
+        seen[0].1["requests"][0],
+        json!({"custom_id": "r-1", "params": {"model": "claude-opus-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "a"}]}})
+    );
+    assert_eq!(seen[0].1["requests"][1]["custom_id"], "r-2");
+    assert!(header(&seen[1].0, "content-type").is_none());
+}
+
+#[tokio::test]
+async fn batch_results_stream_line_by_line() {
+    let message = serde_json::from_str::<Value>(CITED).unwrap();
+    let lines = [
+        json!({"custom_id": "r-2", "result": {"type": "succeeded", "message": message}}),
+        json!({"custom_id": "r-1", "result": {"type": "errored", "error": {"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}}}}),
+        json!({"custom_id": "r-3", "result": {"type": "errored", "error": {"type": "overloaded_error", "message": "busy"}}}),
+        json!({"custom_id": "r-4", "result": {"type": "canceled"}}),
+        json!({"custom_id": "r-5", "result": {"type": "expired"}}),
+        json!({"custom_id": "r-6", "result": {"type": "postponed", "until": "later"}}),
+    ];
+    // The last line has no trailing newline.
+    let body = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    let (url, server) = serve(vec![reply(200, body)]).await;
+    let results = client(&url, 0).batch_results("msgbatch_1").await.unwrap().collect().await.unwrap();
+
+    assert_eq!(server.calls.lock().unwrap()[0].1, "/v1/messages/batches/msgbatch_1/results");
+    assert_eq!(results.len(), 6);
+    let BatchOutcome::Succeeded { message } = &results[0].result else { panic!() };
+    assert_eq!(message.citations().count(), 2);
+    assert_eq!(results[1].result.error().unwrap().kind, "invalid_request_error");
+    assert_eq!(results[2].result.error().unwrap().kind, "overloaded_error");
+    assert_eq!(results[3].result, BatchOutcome::Canceled);
+    assert_eq!(results[4].result, BatchOutcome::Expired);
+    assert_eq!(serde_json::to_value(&results[5].result).unwrap(), lines[5]["result"]);
+}
+
+const FILE: &str = r#"{"id": "file_011", "type": "file", "filename": "ghid.pdf", "mime_type": "application/pdf", "size_bytes": 4,
+  "created_at": "2026-10-04T07:00:00Z", "downloadable": false}"#;
+
+#[tokio::test]
+async fn files_upload_list_get_download_delete() {
+    let page = format!(r#"{{"data": [{FILE}], "has_more": false, "first_id": "file_011", "last_id": "file_011"}}"#);
+    let (url, server) =
+        serve(vec![reply(200, FILE), reply(200, page), reply(200, FILE), reply(200, "%PDF"), reply(200, r#"{"id": "file_011", "type": "file_deleted"}"#)])
+            .await;
+    let c = client(&url, 0);
+    let uploaded = c.upload_file("ghid.pdf", "application/pdf", b"%PDF").await.unwrap();
+    assert_eq!((uploaded.id.as_str(), uploaded.size_bytes, uploaded.downloadable), ("file_011", 4, false));
+    let params = ListParams { limit: Some(5), after_id: Some("file_000".into()), ..ListParams::default() };
+    let listed = c.list_files(&params).await.unwrap();
+    assert_eq!(listed.data[0].filename, "ghid.pdf");
+    assert!(listed.next_params(&params).is_none());
+    assert_eq!(c.file("../v1/x?y").await.unwrap().mime_type, "application/pdf");
+    assert_eq!(c.download_file("file_011").await.unwrap(), b"%PDF");
+    assert_eq!(c.delete_file("file_011").await.unwrap().id, "file_011");
+
+    let calls = server.calls.lock().unwrap();
+    let routes: Vec<_> = calls.iter().map(|(m, u, _)| format!("{m} {u}")).collect();
+    assert_eq!(
+        routes,
+        [
+            "POST /v1/files",
+            "GET /v1/files?limit=5&after_id=file_000",
+            // An id cannot leave its path segment.
+            "GET /v1/files/..%2Fv1%2Fx%3Fy",
+            "GET /v1/files/file_011/content",
+            "DELETE /v1/files/file_011"
+        ]
+    );
+    let seen = server.seen.lock().unwrap();
+    assert!(header(&seen[0].0, "content-type").unwrap().starts_with("multipart/form-data; boundary="));
+    assert_eq!(header(&seen[0].0, "x-api-key"), Some(KEY));
+    let upload = &calls[0].2;
+    assert!(upload.contains(r#"Content-Disposition: form-data; name="file"; filename="ghid.pdf""#), "{upload}");
+    assert!(upload.contains("Content-Type: application/pdf\r\n\r\n%PDF\r\n"), "{upload}");
+
+    let block = serde_json::to_value(ContentBlockParam::file_document(&uploaded.id)).unwrap();
+    assert_eq!(block, json!({"type": "document", "source": {"type": "file", "file_id": "file_011"}}));
+}
+
+#[tokio::test]
+async fn models_list_and_retrieve_with_capabilities() {
+    let model = json!({"type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "created_at": "2026-09-01T00:00:00Z",
+        "max_input_tokens": 1000000, "max_tokens": 128000,
+        "capabilities": {"image_input": {"supported": true}, "thinking": {"supported": true, "types": {"enabled": {"supported": false}, "adaptive": {"supported": true}}},
+                         "effort": {"supported": true, "max": {"supported": true}}}});
+    let page = json!({"data": [model], "has_more": false, "first_id": "claude-opus-5-5", "last_id": "claude-opus-5-5"});
+    let (url, server) = serve(vec![reply(200, page.to_string()), reply(200, model.to_string())]).await;
+    let c = client(&url, 0);
+    let listed = c.list_models(&ListParams::default()).await.unwrap();
+    assert_eq!(listed.data.len(), 1);
+    let m = c.model("claude-opus-5-5").await.unwrap();
+    assert_eq!((m.max_input_tokens, m.max_tokens), (Some(1_000_000), Some(128_000)));
+    assert!(m.supports(&["image_input"]));
+    assert!(m.supports(&["thinking", "types", "adaptive"]));
+    assert!(!m.supports(&["thinking", "types", "enabled"]));
+    assert!(m.supports(&["effort", "max"]));
+    assert!(!m.supports(&["pdf_input"]));
+    assert_eq!(serde_json::to_value(&m).unwrap(), model);
+
+    let calls = server.calls.lock().unwrap();
+    assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("GET", "/v1/models"));
+    assert_eq!(calls[1].1, "/v1/models/claude-opus-5-5");
 }

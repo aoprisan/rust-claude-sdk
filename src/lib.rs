@@ -12,6 +12,7 @@
 //! - streaming over server-sent events, event by event or accumulated into the final message;
 //! - server tools (web search, web fetch, code execution, tool search) with typed
 //!   definitions, result blocks, web search citations and `usage.server_tool_use`;
+//! - a tool-use loop (`Client::run_tools`) that runs your tools and resumes paused turns;
 //! - `POST /v1/messages/count_tokens`, Message Batches, the Files API and the Models API.
 //!
 //! ```no_run
@@ -48,6 +49,7 @@ mod page;
 mod request;
 mod response;
 mod stream;
+mod tools;
 
 pub use batches::{BatchOutcome, BatchRequest, BatchResult, BatchResults, MessageBatch, ProcessingStatus, RequestCounts};
 pub use client::{CallOptions, Client, ClientConfig, Credential, API_VERSION, DEFAULT_BASE_URL};
@@ -65,3 +67,4 @@ pub use response::{
     ToolSearchContent, ToolSearchFound, Usage, WebFetchContent, WebFetchResult, WebSearchContent, WebSearchResult,
 };
 pub use stream::{Delta, MessageStream, StreamEvent};
+pub use tools::{ToolCall, ToolLoopOptions, ToolOutput, ToolRun};

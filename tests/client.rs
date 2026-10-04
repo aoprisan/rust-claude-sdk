@@ -12,7 +12,8 @@ use axum::Router;
 use rust_claude_sdk::{
     BatchOutcome, BatchRequest, CacheControl, CallOptions, Citation, Client, ClientConfig, CodeExecutionContent, CodeExecutionTool, ContentBlock,
     ContentBlockParam, Credential, Delta, Effort, Error, Fallbacks, ListParams, MessageParam, MessagesRequest, ProcessingStatus, StopReason, StreamEvent,
-    ThinkingConfig, ThinkingDisplay, Tool, ToolSearchTool, UserLocation, WebFetchContent, WebFetchTool, WebSearchContent, WebSearchTool,
+    ThinkingConfig, ThinkingDisplay, Tool, ToolLoopOptions, ToolOutput, ToolSearchTool, UserLocation, WebFetchContent, WebFetchTool, WebSearchContent,
+    WebSearchTool,
 };
 use serde_json::{json, Value};
 
@@ -636,4 +637,103 @@ async fn models_list_and_retrieve_with_capabilities() {
     let calls = server.calls.lock().unwrap();
     assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("GET", "/v1/models"));
     assert_eq!(calls[1].1, "/v1/models/claude-opus-5-5");
+}
+
+fn turn(stop_reason: &str, content: Value, input_tokens: u64) -> Reply {
+    reply(
+        200,
+        json!({"id": "msg_t", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": content,
+               "stop_reason": stop_reason, "stop_sequence": null, "usage": {"input_tokens": input_tokens, "output_tokens": 5}})
+        .to_string(),
+    )
+}
+
+fn cui_request() -> MessagesRequest {
+    MessagesRequest::new("claude-opus-5-5", 1024)
+        .tool(Tool::new("cui", "Checks a CUI", json!({"type": "object", "properties": {"cui": {"type": "string"}}, "required": ["cui"]})))
+        .user("Check RO1 and RO2")
+}
+
+async fn check_cui(cui: String) -> Result<String, String> {
+    tokio::time::sleep(Duration::from_millis(if cui == "RO1" { 50 } else { 0 })).await;
+    if cui == "RO1" {
+        Ok("active".into())
+    } else {
+        Err(format!("unknown CUI {cui}"))
+    }
+}
+
+#[tokio::test]
+async fn the_tool_loop_runs_parallel_calls_and_resumes_paused_turns() {
+    let (url, server) = serve(vec![
+        turn(
+            "tool_use",
+            json!([
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "tool_use", "id": "toolu_1", "name": "cui", "input": {"cui": "RO1"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "cui", "input": {"cui": "RO2"}}
+            ]),
+            10,
+        ),
+        turn("pause_turn", json!([{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "RO2"}}]), 20),
+        turn("end_turn", json!([{"type": "text", "text": "RO1 is active."}]), 30),
+    ])
+    .await;
+    let mut req = cui_request();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen_calls = calls.clone();
+    let run = client(&url, 0)
+        .run_tools(&mut req, move |call| {
+            seen_calls.lock().unwrap().push(call.name.clone());
+            check_cui(call.input["cui"].as_str().unwrap_or_default().to_string())
+        })
+        .await
+        .unwrap();
+
+    assert!(run.is_finished());
+    assert_eq!(run.requests, 3);
+    assert_eq!(run.message.text(), "RO1 is active.");
+    assert_eq!((run.usage.input_tokens, run.usage.output_tokens), (60, 15));
+    assert_eq!(*calls.lock().unwrap(), vec!["cui", "cui"]);
+    assert_eq!(req.messages.len(), 5);
+
+    let seen = server.seen.lock().unwrap();
+    let second = &seen[1].1["messages"];
+    assert_eq!(second[1]["role"], "assistant");
+    assert_eq!(second[1]["content"][0], json!({"type": "thinking", "thinking": "", "signature": "sig"}));
+    // Both results in one user turn, in call order although RO1 finished last.
+    assert_eq!(
+        second[2],
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "active"},
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "unknown CUI RO2", "is_error": true}
+        ]})
+    );
+    // A paused turn is sent back as the last message, with no user turn after it.
+    let third = seen[2].1["messages"].as_array().unwrap();
+    assert_eq!(third.len(), 4);
+    assert_eq!(third[3]["role"], "assistant");
+    assert_eq!(third[3]["content"][0]["type"], "server_tool_use");
+}
+
+#[tokio::test]
+async fn a_tool_loop_cut_short_resumes_with_the_pending_calls() {
+    let (url, server) = serve(vec![
+        turn("tool_use", json!([{"type": "tool_use", "id": "toolu_1", "name": "cui", "input": {"cui": "RO1"}}]), 10),
+        turn("end_turn", json!([{"type": "text", "text": "Done."}]), 10),
+    ])
+    .await;
+    let c = client(&url, 0);
+    let mut req = cui_request();
+    let options = ToolLoopOptions { max_requests: 1, ..ToolLoopOptions::default() };
+    let run = c.run_tools_with(&mut req, options, |_| async { ToolOutput::text("never") }).await.unwrap();
+    assert!(!run.is_finished());
+    assert_eq!(run.message.stop_reason, Some(StopReason::ToolUse));
+    assert_eq!(req.messages.len(), 2);
+
+    let run = c.run_tools(&mut req, |call| async move { format!("{} ok", call.input["cui"].as_str().unwrap()) }).await.unwrap();
+    assert!(run.is_finished());
+    assert_eq!(run.requests, 1);
+    let sent = &server.seen.lock().unwrap()[1].1["messages"];
+    assert_eq!(sent[2], json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "RO1 ok"}]}));
 }

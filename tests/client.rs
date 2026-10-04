@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use claude_sdk::{
+use rust_claude_sdk::{
     CacheControl, CallOptions, Citation, Client, ClientConfig, ContentBlock, ContentBlockParam, Credential, Delta, Effort, Error, Fallbacks, MessageParam,
     MessagesRequest, StopReason, StreamEvent, ThinkingConfig, ThinkingDisplay, Tool,
 };
@@ -213,7 +213,7 @@ async fn fallback_list_tools_thinking_and_bearer_tokens() {
     let req = MessagesRequest::new("claude-sonnet-5-5", 512)
         .user("salut")
         .thinking(ThinkingConfig::Adaptive { display: Some(ThinkingDisplay::Summarized) })
-        .fallbacks(Fallbacks::Models(vec![claude_sdk::FallbackModel { model: "claude-opus-4-8".into(), max_tokens: None }]))
+        .fallbacks(Fallbacks::Models(vec![rust_claude_sdk::FallbackModel { model: "claude-opus-4-8".into(), max_tokens: None }]))
         .tool(Tool {
             name: "cui".into(),
             description: "Checks a CUI".into(),

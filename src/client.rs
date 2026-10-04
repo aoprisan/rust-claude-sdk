@@ -142,7 +142,7 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Client, Error> {
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
-            .user_agent(concat!("claude-sdk/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::Config(e.to_string()))?;
         Ok(Client { config, http })

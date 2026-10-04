@@ -1,4 +1,4 @@
-# claude-sdk
+# rust-claude-sdk
 
 A small typed Rust client for Anthropic's Messages API (`POST /v1/messages`) over raw HTTPS, following the documented wire format. There is no official Rust SDK.
 
@@ -12,11 +12,11 @@ A small typed Rust client for Anthropic's Messages API (`POST /v1/messages`) ove
 
 ```toml
 [dependencies]
-claude-sdk = { git = "https://github.com/aoprisan/rust-claude-sdk" }
+rust-claude-sdk = "0.1"
 ```
 
 ```rust
-use claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
+use rust_claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
 
 let client = Client::new(ClientConfig::from_env().expect("ANTHROPIC_API_KEY"))?;
 let request = MessagesRequest::new("claude-opus-5-5", 2048)
@@ -42,5 +42,20 @@ cargo test --locked
 ```
 
 Tests run against a local mock server and need no API key.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, merge to `main`, then push a matching tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `Release` workflow checks that the tag matches the crate version, runs the checks above and publishes to crates.io with the `CARGO_REGISTRY_TOKEN` repository secret.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
 Originally written as the `rogov-anthropic` crate in [aoprisan/govromania](https://github.com/aoprisan/govromania).

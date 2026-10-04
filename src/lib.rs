@@ -15,9 +15,9 @@
 //! - `POST /v1/messages/count_tokens`.
 //!
 //! ```no_run
-//! use claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
+//! use rust_claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
 //!
-//! # async fn run() -> Result<(), claude_sdk::Error> {
+//! # async fn run() -> Result<(), rust_claude_sdk::Error> {
 //! let client = Client::new(ClientConfig::from_env().expect("ANTHROPIC_API_KEY"))?;
 //! let request = MessagesRequest::new("claude-opus-5-5", 2048)
 //!     .system_cached("Answer only from the documents and cite them.")

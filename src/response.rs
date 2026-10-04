@@ -45,6 +45,29 @@ impl Message {
         })
     }
 
+    /// The web search results in this message, across all searches.
+    pub fn web_search_results(&self) -> impl Iterator<Item = &WebSearchResult> {
+        self.content.iter().flat_map(|b| match b {
+            ContentBlock::WebSearchToolResult { content: WebSearchContent::Results(r), .. } => r.iter().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+    }
+
+    /// Server tool calls that failed, with the id of the call: `(tool_use_id, error)`.
+    pub fn server_tool_errors(&self) -> impl Iterator<Item = (&str, &ServerToolError)> {
+        self.content.iter().filter_map(|b| {
+            let err = match b {
+                ContentBlock::WebSearchToolResult { content: WebSearchContent::Error(e), .. }
+                | ContentBlock::WebFetchToolResult { content: WebFetchContent::Error(e), .. }
+                | ContentBlock::BashCodeExecutionToolResult { content: CodeExecutionContent::Error(e), .. }
+                | ContentBlock::CodeExecutionToolResult { content: CodeExecutionContent::Error(e), .. }
+                | ContentBlock::ToolSearchToolResult { content: ToolSearchContent::Error(e), .. } => e,
+                _ => return None,
+            };
+            Some((b.server_tool_result_id()?, err))
+        })
+    }
+
     /// The tool calls the model asked for: `(id, name, input)`.
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
@@ -54,7 +77,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -77,6 +100,53 @@ pub enum ContentBlock {
         #[serde(default)]
         input: Value,
     },
+    /// A call of a server tool (web search, web fetch, code execution...), run by the API.
+    ServerToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: WebSearchContent,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: WebFetchContent,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    BashCodeExecutionToolResult {
+        tool_use_id: String,
+        content: CodeExecutionContent,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    /// The result of an older code execution version.
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: CodeExecutionContent,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    /// A file the sandbox viewed, created or edited; `content` kept as sent.
+    TextEditorCodeExecutionToolResult {
+        tool_use_id: String,
+        content: Value,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchContent,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    },
     /// Marks where a refused attempt handed over to a fallback model.
     Fallback {
         from: ModelRef,
@@ -86,47 +156,162 @@ pub enum ContentBlock {
     #[serde(skip)]
     Other(Value),
 }
-open_enum!(ContentBlock, ["text", "thinking", "redacted_thinking", "tool_use", "fallback"]);
+open_enum!(
+    ContentBlock,
+    [
+        "text",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "bash_code_execution_tool_result",
+        "code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+        "fallback",
+    ]
+);
 
-// `remote = "Self"` derives `serialize` as an inherent fn; the derive must sit on the same
-// item, so it is spelled out here.
 impl ContentBlock {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum Out<'a> {
-            Text {
-                text: &'a str,
-                #[serde(skip_serializing_if = "<[Citation]>::is_empty")]
-                citations: &'a [Citation],
-            },
-            Thinking {
-                thinking: &'a str,
-                signature: &'a str,
-            },
-            RedactedThinking {
-                data: &'a str,
-            },
-            ToolUse {
-                id: &'a str,
-                name: &'a str,
-                input: &'a Value,
-            },
-            Fallback {
-                from: &'a ModelRef,
-                to: &'a ModelRef,
-            },
+    /// The `tool_use_id` of a server tool's result block.
+    pub fn server_tool_result_id(&self) -> Option<&str> {
+        match self {
+            ContentBlock::WebSearchToolResult { tool_use_id, .. }
+            | ContentBlock::WebFetchToolResult { tool_use_id, .. }
+            | ContentBlock::BashCodeExecutionToolResult { tool_use_id, .. }
+            | ContentBlock::CodeExecutionToolResult { tool_use_id, .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { tool_use_id, .. }
+            | ContentBlock::ToolSearchToolResult { tool_use_id, .. } => Some(tool_use_id),
+            _ => None,
         }
-        let out = match self {
-            ContentBlock::Text { text, citations } => Out::Text { text, citations },
-            ContentBlock::Thinking { thinking, signature } => Out::Thinking { thinking, signature },
-            ContentBlock::RedactedThinking { data } => Out::RedactedThinking { data },
-            ContentBlock::ToolUse { id, name, input } => Out::ToolUse { id, name, input },
-            ContentBlock::Fallback { from, to } => Out::Fallback { from, to },
-            ContentBlock::Other(v) => return v.serialize(s),
-        };
-        out.serialize(s)
     }
+}
+
+/// A server tool that ran but failed (`max_uses_exceeded`, `too_many_requests`,
+/// `unavailable`, `url_not_accessible`...). The response itself still succeeds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerToolError {
+    pub error_code: String,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// What a web search returned: a list of results, or an error object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebSearchContent {
+    Results(Vec<WebSearchResult>),
+    Error(ServerToolError),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebSearchResult {
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    /// How old the page is, when known (e.g. `"2 days ago"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_age: Option<String>,
+    /// Opaque page content; must be echoed back for later turns to cite it.
+    #[serde(default)]
+    pub encrypted_content: String,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// What a web fetch returned: the page, or an error object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebFetchContent {
+    Page(WebFetchResult),
+    Error(ServerToolError),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebFetchResult {
+    pub url: String,
+    /// A `document` block holding the page (`source.data` is its text for text pages).
+    pub content: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieved_at: Option<String>,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl WebFetchResult {
+    /// The fetched text, when the page came back as a text document.
+    pub fn text(&self) -> Option<&str> {
+        self.content.get("source").and_then(|s| s.get("data")).and_then(Value::as_str)
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.content.get("title").and_then(Value::as_str)
+    }
+}
+
+/// What a code execution returned: its output, or an error object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CodeExecutionContent {
+    Output(CodeExecutionOutput),
+    Error(ServerToolError),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeExecutionOutput {
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    /// `0` on success.
+    pub return_code: i64,
+    /// Files the code wrote: `{"type": ..., "file_id": ...}`, downloadable with
+    /// `Client::download_file`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<Value>,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl CodeExecutionOutput {
+    /// Ids of the files the code wrote.
+    pub fn file_ids(&self) -> impl Iterator<Item = &str> {
+        self.content.iter().filter_map(|f| f.get("file_id").and_then(Value::as_str))
+    }
+}
+
+/// What a tool search found: references to the tools now loaded, or an error object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolSearchContent {
+    Found(ToolSearchFound),
+    Error(ServerToolError),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSearchFound {
+    pub tool_references: Vec<ToolReference>,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolReference {
+    pub tool_name: String,
+    /// `type` and anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +320,7 @@ pub struct ModelRef {
 }
 
 /// Where a cited span comes from.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum Citation {
     /// Plain-text document: character range, end exclusive.
@@ -165,74 +350,31 @@ pub enum Citation {
         start_block_index: usize,
         end_block_index: usize,
     },
-    /// Any other citation type (search results, web pages...), kept verbatim.
+    /// A web search result.
+    WebSearchResultLocation {
+        url: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        cited_text: String,
+        /// Opaque; must be echoed back unchanged.
+        #[serde(default)]
+        encrypted_index: String,
+    },
+    /// Any other citation type (search results...), kept verbatim.
     #[serde(skip)]
     Other(Value),
 }
-open_enum!(Citation, ["char_location", "page_location", "content_block_location"]);
+open_enum!(Citation, ["char_location", "page_location", "content_block_location", "web_search_result_location"]);
 
 impl Citation {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // Variant names are the wire tags.
-        #[allow(clippy::enum_variant_names)]
-        #[derive(Serialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum Out<'a> {
-            CharLocation {
-                cited_text: &'a str,
-                document_index: usize,
-                document_title: &'a Option<String>,
-                start_char_index: usize,
-                end_char_index: usize,
-            },
-            PageLocation {
-                cited_text: &'a str,
-                document_index: usize,
-                document_title: &'a Option<String>,
-                start_page_number: usize,
-                end_page_number: usize,
-            },
-            ContentBlockLocation {
-                cited_text: &'a str,
-                document_index: usize,
-                document_title: &'a Option<String>,
-                start_block_index: usize,
-                end_block_index: usize,
-            },
-        }
-        let out = match self {
-            Citation::CharLocation { cited_text, document_index, document_title, start_char_index, end_char_index } => Out::CharLocation {
-                cited_text,
-                document_index: *document_index,
-                document_title,
-                start_char_index: *start_char_index,
-                end_char_index: *end_char_index,
-            },
-            Citation::PageLocation { cited_text, document_index, document_title, start_page_number, end_page_number } => Out::PageLocation {
-                cited_text,
-                document_index: *document_index,
-                document_title,
-                start_page_number: *start_page_number,
-                end_page_number: *end_page_number,
-            },
-            Citation::ContentBlockLocation { cited_text, document_index, document_title, start_block_index, end_block_index } => Out::ContentBlockLocation {
-                cited_text,
-                document_index: *document_index,
-                document_title,
-                start_block_index: *start_block_index,
-                end_block_index: *end_block_index,
-            },
-            Citation::Other(v) => return v.serialize(s),
-        };
-        out.serialize(s)
-    }
-
     /// The quoted source text, when the citation type has one.
     pub fn cited_text(&self) -> Option<&str> {
         match self {
-            Citation::CharLocation { cited_text, .. } | Citation::PageLocation { cited_text, .. } | Citation::ContentBlockLocation { cited_text, .. } => {
-                Some(cited_text)
-            }
+            Citation::CharLocation { cited_text, .. }
+            | Citation::PageLocation { cited_text, .. }
+            | Citation::ContentBlockLocation { cited_text, .. }
+            | Citation::WebSearchResultLocation { cited_text, .. } => Some(cited_text),
             Citation::Other(v) => v.get("cited_text").and_then(Value::as_str),
         }
     }
@@ -243,7 +385,17 @@ impl Citation {
             Citation::CharLocation { document_index, .. }
             | Citation::PageLocation { document_index, .. }
             | Citation::ContentBlockLocation { document_index, .. } => Some(*document_index),
+            Citation::WebSearchResultLocation { .. } => None,
             Citation::Other(v) => v.get("document_index").and_then(Value::as_u64).map(|i| i as usize),
+        }
+    }
+
+    /// The cited page of a web search result.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Citation::WebSearchResultLocation { url, .. } => Some(url),
+            Citation::Other(v) => v.get("url").and_then(Value::as_str),
+            _ => None,
         }
     }
 }
@@ -315,13 +467,16 @@ pub struct Usage {
     /// Tokens read from the prompt cache; zero on every request means the prefix changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
+    /// How many times each server tool ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUsage>,
     /// Anything else (`iterations`, `service_tier`, `inference_geo`...).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 impl Usage {
-    /// Adds another request's token counts; `extra` is left as is.
+    /// Adds another request's token and server tool counts; `extra` is left as is.
     pub(crate) fn add(&mut self, other: &Usage) {
         fn sum(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             if a.is_none() && b.is_none() {
@@ -334,6 +489,11 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.cache_creation_input_tokens = sum(self.cache_creation_input_tokens, other.cache_creation_input_tokens);
         self.cache_read_input_tokens = sum(self.cache_read_input_tokens, other.cache_read_input_tokens);
+        if let Some(o) = &other.server_tool_use {
+            let s = self.server_tool_use.get_or_insert_with(ServerToolUsage::default);
+            s.web_search_requests += o.web_search_requests;
+            s.web_fetch_requests += o.web_fetch_requests;
+        }
     }
 
     /// Applies the cumulative counts of a `message_delta` event.
@@ -347,10 +507,23 @@ impl Usage {
                 "output_tokens" => self.output_tokens = v.as_u64().unwrap_or(self.output_tokens),
                 "cache_creation_input_tokens" => self.cache_creation_input_tokens = v.as_u64(),
                 "cache_read_input_tokens" => self.cache_read_input_tokens = v.as_u64(),
+                "server_tool_use" => self.server_tool_use = serde_json::from_value(v.clone()).ok(),
                 _ => {
                     self.extra.insert(k.clone(), v.clone());
                 }
             }
         }
     }
+}
+
+/// `usage.server_tool_use`: billable server tool calls.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerToolUsage {
+    #[serde(default)]
+    pub web_search_requests: u64,
+    #[serde(default)]
+    pub web_fetch_requests: u64,
+    /// Anything else.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }

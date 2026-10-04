@@ -1,7 +1,5 @@
-//! A small typed client for Anthropic's Messages API (`POST /v1/messages`).
-//!
-//! There is no official Rust SDK, so this crate covers what the server needs over raw HTTPS,
-//! following the documented wire format:
+//! A small typed client for Anthropic's Messages API (`POST /v1/messages`) and the endpoints
+//! around it, over raw HTTPS following the documented wire format:
 //!
 //! - requests with system prompts, `document` blocks with citations, images, tools, thinking
 //!   and effort settings, `cache_control` breakpoints and server-side refusal `fallbacks`
@@ -12,13 +10,15 @@
 //! - retries on connection errors, 408, 409, 429 and 5xx (honouring `retry-after` and
 //!   `x-should-retry`), bounded by an optional deadline that also cuts retries short;
 //! - streaming over server-sent events, event by event or accumulated into the final message;
+//! - server tools (web search, web fetch, code execution, tool search) with typed
+//!   definitions, result blocks, web search citations and `usage.server_tool_use`;
 //! - a tool-use loop (`Client::run_tools`) that runs your tools and resumes paused turns;
-//! - `POST /v1/messages/count_tokens`.
+//! - `POST /v1/messages/count_tokens`, Message Batches, the Files API and the Models API.
 //!
 //! ```no_run
-//! use claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
+//! use rust_claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
 //!
-//! # async fn run() -> Result<(), claude_sdk::Error> {
+//! # async fn run() -> Result<(), rust_claude_sdk::Error> {
 //! let client = Client::new(ClientConfig::from_env().expect("ANTHROPIC_API_KEY"))?;
 //! let request = MessagesRequest::new("claude-opus-5-5", 2048)
 //!     .system_cached("Answer only from the documents and cite them.")
@@ -40,19 +40,31 @@
 #[macro_use]
 mod open;
 
+mod batches;
 mod client;
 mod error;
+mod files;
+mod models;
+mod page;
 mod request;
 mod response;
 mod stream;
 mod tools;
 
+pub use batches::{BatchOutcome, BatchRequest, BatchResult, BatchResults, MessageBatch, ProcessingStatus, RequestCounts};
 pub use client::{CallOptions, Client, ClientConfig, Credential, API_VERSION, DEFAULT_BASE_URL};
 pub use error::{ApiErrorBody, Error};
+pub use files::FileMetadata;
+pub use models::Model;
+pub use page::{Deleted, ListParams, Page};
 pub use request::{
-    CacheControl, CitationsConfig, Content, ContentBlockParam, DocumentSource, Effort, FallbackModel, Fallbacks, ImageSource, MessageParam, MessagesRequest,
-    OutputConfig, Role, System, SystemBlock, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, ToolDefinition, ToolResultContent,
+    CacheControl, CitationsConfig, CodeExecutionTool, Content, ContentBlockParam, DocumentSource, Effort, FallbackModel, Fallbacks, ImageSource, MessageParam,
+    MessagesRequest, OutputConfig, Role, System, SystemBlock, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, ToolDefinition, ToolResultContent,
+    ToolSearchTool, UserLocation, WebFetchTool, WebSearchTool,
 };
-pub use response::{Citation, ContentBlock, Message, ModelRef, StopReason, Usage};
+pub use response::{
+    Citation, CodeExecutionContent, CodeExecutionOutput, ContentBlock, Message, ModelRef, ServerToolError, ServerToolUsage, StopReason, ToolReference,
+    ToolSearchContent, ToolSearchFound, Usage, WebFetchContent, WebFetchResult, WebSearchContent, WebSearchResult,
+};
 pub use stream::{Delta, MessageStream, StreamEvent};
 pub use tools::{ToolCall, ToolLoopOptions, ToolOutput, ToolRun};

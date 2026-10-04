@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::time::Duration;
 
-use claude_sdk::{CallOptions, Client, ClientConfig, ContentBlockParam, Delta, Effort, Fallbacks, MessageParam, MessagesRequest, StreamEvent};
+use rust_claude_sdk::{CallOptions, Client, ClientConfig, ContentBlockParam, Delta, Effort, Fallbacks, MessageParam, MessagesRequest, StreamEvent};
 
 const SYSTEM: &str = "You answer questions about Romanian public services using only the documents provided. \
 Cite the documents for every factual statement. If the documents do not answer the question, say so and name \

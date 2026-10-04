@@ -321,6 +321,21 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Adds another request's token counts; `extra` is left as is.
+    pub(crate) fn add(&mut self, other: &Usage) {
+        fn sum(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            if a.is_none() && b.is_none() {
+                None
+            } else {
+                Some(a.unwrap_or(0) + b.unwrap_or(0))
+            }
+        }
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens = sum(self.cache_creation_input_tokens, other.cache_creation_input_tokens);
+        self.cache_read_input_tokens = sum(self.cache_read_input_tokens, other.cache_read_input_tokens);
+    }
+
     /// Applies the cumulative counts of a `message_delta` event.
     pub(crate) fn merge(&mut self, delta: &Map<String, Value>) {
         for (k, v) in delta {

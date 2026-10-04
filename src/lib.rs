@@ -12,6 +12,7 @@
 //! - retries on connection errors, 408, 409, 429 and 5xx (honouring `retry-after` and
 //!   `x-should-retry`), bounded by an optional deadline that also cuts retries short;
 //! - streaming over server-sent events, event by event or accumulated into the final message;
+//! - a tool-use loop (`Client::run_tools`) that runs your tools and resumes paused turns;
 //! - `POST /v1/messages/count_tokens`.
 //!
 //! ```no_run
@@ -44,6 +45,7 @@ mod error;
 mod request;
 mod response;
 mod stream;
+mod tools;
 
 pub use client::{CallOptions, Client, ClientConfig, Credential, API_VERSION, DEFAULT_BASE_URL};
 pub use error::{ApiErrorBody, Error};
@@ -53,3 +55,4 @@ pub use request::{
 };
 pub use response::{Citation, ContentBlock, Message, ModelRef, StopReason, Usage};
 pub use stream::{Delta, MessageStream, StreamEvent};
+pub use tools::{ToolCall, ToolLoopOptions, ToolOutput, ToolRun};

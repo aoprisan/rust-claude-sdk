@@ -100,7 +100,25 @@ println!("{:?} tokens of context, adaptive thinking: {}", opus.max_input_tokens,
 let page = client.list_models(&ListParams::default()).await?;
 ```
 
-A streaming, grounded example: `ANTHROPIC_API_KEY=... cargo run --example grounded -- "În cât timp primesc buletinul?"`
+## Examples
+
+Runnable programs in [`examples/`](examples), each started with `ANTHROPIC_API_KEY=... cargo run --example <name>`:
+
+| Example | Shows |
+| --- | --- |
+| [`grounded`](examples/grounded.rs) | A streamed answer grounded in documents, with citations, prompt caching, effort and refusal fallbacks |
+| [`chat`](examples/chat.rs) | A multi-turn terminal chat: streaming, adaptive thinking shown live, echoing assistant turns back |
+| [`tools`](examples/tools.rs) | The tool-use loop with two local tools (one strict), concurrent calls and a deadline |
+| [`web_search`](examples/web_search.rs) | Web search and web fetch server tools, cited sources, server tool errors and usage |
+| [`code_execution`](examples/code_execution.rs) | Server-side code execution, its output, and downloading the files it writes |
+| [`files`](examples/files.rs) | Uploading a PDF to the Files API, asking about it by id with citations, deleting it |
+| [`batch`](examples/batch.rs) | Creating a Message Batch, polling it and streaming its results |
+| [`models`](examples/models.rs) | Paging through the Models API with capabilities, and counting tokens |
+
+```sh
+ANTHROPIC_API_KEY=... cargo run --example grounded -- "În cât timp primesc buletinul?"
+ANTHROPIC_API_KEY=... cargo run --example files -- ghid.pdf "Rezumă în cinci puncte."
+```
 
 ## Development
 

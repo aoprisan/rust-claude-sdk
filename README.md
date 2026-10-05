@@ -2,7 +2,7 @@
 
 A small typed Rust client for Anthropic's Messages API (`POST /v1/messages`) and the endpoints around it, over raw HTTPS, following the documented wire format.
 
-- Requests with system prompts, `document` blocks with citations, images, tools, thinking and effort settings, `cache_control` breakpoints and server-side refusal `fallbacks` (the matching `anthropic-beta` header is added automatically).
+- Requests with system prompts (top-level or mid-conversation), `document` blocks with citations, images, tools, thinking and effort settings, task budgets, structured outputs (`json_schema`, read back with `Message::json`), `cache_control` breakpoints and server-side refusal `fallbacks` (the matching `anthropic-beta` headers are added automatically).
 - Responses with text, citations, thinking, tool calls and fallback markers. Unknown block, citation, event and delta types are kept as raw JSON (`Other`) instead of failing, so a new API feature never breaks decoding and assistant turns echo back intact.
 - Retries on connection errors, 408, 409, 429 and 5xx (honouring `retry-after` and `x-should-retry`), bounded by an optional deadline that also cuts retries short.
 - Streaming over server-sent events, event by event or accumulated into the final message.
@@ -14,7 +14,7 @@ A small typed Rust client for Anthropic's Messages API (`POST /v1/messages`) and
 
 ```toml
 [dependencies]
-rust-claude-sdk = "0.2"
+rust-claude-sdk = "0.3"
 ```
 
 ```rust

@@ -1,9 +1,10 @@
 //! A small typed client for Anthropic's Messages API (`POST /v1/messages`) and the endpoints
 //! around it, over raw HTTPS following the documented wire format:
 //!
-//! - requests with system prompts, `document` blocks with citations, images, tools, thinking
-//!   and effort settings, `cache_control` breakpoints and server-side refusal `fallbacks`
-//!   (the matching `anthropic-beta` header is added automatically);
+//! - requests with system prompts (top-level or mid-conversation), `document` blocks with
+//!   citations, images, tools, thinking and effort settings, task budgets, structured outputs,
+//!   `cache_control` breakpoints and server-side refusal `fallbacks` (the matching
+//!   `anthropic-beta` headers are added automatically);
 //! - responses with text, citations, thinking, tool calls and fallback markers, keeping
 //!   any block, citation, event or delta type it does not know as raw JSON instead of
 //!   failing, so a new API feature never breaks decoding and assistant turns echo back intact;
@@ -59,7 +60,7 @@ pub use models::Model;
 pub use page::{Deleted, ListParams, Page};
 pub use request::{
     CacheControl, CitationsConfig, CodeExecutionTool, Content, ContentBlockParam, DocumentSource, Effort, FallbackModel, Fallbacks, ImageSource, MessageParam,
-    MessagesRequest, OutputConfig, Role, System, SystemBlock, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, ToolDefinition, ToolResultContent,
+    MessagesRequest, OutputConfig, Role, System, SystemBlock, TaskBudget, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, ToolDefinition, ToolResultContent,
     ToolSearchTool, UserLocation, WebFetchTool, WebSearchTool,
 };
 pub use response::{

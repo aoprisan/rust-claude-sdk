@@ -37,6 +37,16 @@ impl Message {
         self.stop_reason == Some(StopReason::Refusal)
     }
 
+    /// The classifier category of a refusal (`"cyber"`, `"bio"`...), when it gives one.
+    pub fn refusal_category(&self) -> Option<&str> {
+        self.stop_details.as_ref()?.get("category")?.as_str()
+    }
+
+    /// The text decoded as JSON, for a request made with `MessagesRequest::json_schema`.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, crate::Error> {
+        serde_json::from_str(&self.text()).map_err(|e| crate::Error::Decode(format!("structured output: {e}")))
+    }
+
     /// Each cited text span with one of its citations, in order.
     pub fn citations(&self) -> impl Iterator<Item = (&str, &Citation)> {
         self.content.iter().flat_map(|b| match b {

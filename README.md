@@ -14,7 +14,7 @@ A small typed Rust client for Anthropic's Messages API (`POST /v1/messages`) and
 
 ```toml
 [dependencies]
-rust-claude-sdk = "0.2"
+rust-claude-sdk = "0.3"
 ```
 
 ```rust

@@ -259,6 +259,49 @@ async fn refusals_are_visible_before_content() {
     assert_eq!(m.stop_details.unwrap()["explanation"], "declined");
 }
 
+#[tokio::test]
+async fn system_messages_task_budgets_structured_outputs_and_eager_tools() {
+    let structured = r#"{"id":"msg_j","type":"message","role":"assistant","model":"claude-opus-5-5",
+        "content":[{"type":"text","text":"{\"days\": 30}"}],"stop_reason":"end_turn","stop_sequence":null,
+        "usage":{"input_tokens":10,"output_tokens":5}}"#;
+    let refused = r#"{"id":"msg_r","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],
+        "stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":null},
+        "usage":{"input_tokens":10,"output_tokens":0}}"#;
+    let (url, server) = serve(vec![reply(200, structured), reply(200, refused)]).await;
+    let schema = json!({"type": "object", "properties": {"days": {"type": "integer"}}, "required": ["days"], "additionalProperties": false});
+    let request = MessagesRequest::new("claude-opus-5-5", 20000)
+        .effort(Effort::High)
+        .task_budget(64000)
+        .json_schema(schema.clone())
+        .beta("task-budgets-2026-03-13")
+        .tool(Tool::new("lookup", "Look up a term", json!({"type": "object"})).eager_input_streaming())
+        .user("În cât timp primesc buletinul?")
+        .message(MessageParam::system("Answer in JSON."));
+    let c = client(&url, 0);
+    let m = c.create(&request).await.unwrap();
+
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        days: u32,
+    }
+    assert_eq!(m.json::<Answer>().unwrap().days, 30);
+    assert!(m.json::<Vec<u32>>().is_err());
+    {
+        let seen = server.seen.lock().unwrap();
+        let (headers, body) = &seen[0];
+        assert_eq!(header(headers, "anthropic-beta"), Some("task-budgets-2026-03-13"));
+        assert_eq!(
+            body["output_config"],
+            json!({"effort": "high", "format": {"type": "json_schema", "schema": schema}, "task_budget": {"type": "tokens", "total": 64000}})
+        );
+        assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(body["messages"][1], json!({"role": "system", "content": "Answer in JSON."}));
+    }
+
+    let m = c.create(&MessagesRequest::new("claude-opus-5-5", 100).user("x")).await.unwrap();
+    assert_eq!(m.refusal_category(), Some("cyber"));
+}
+
 fn sse(events: &[Value]) -> String {
     events.iter().map(|e| format!("event: {}\ndata: {}\n\n", e["type"].as_str().unwrap(), e)).collect()
 }

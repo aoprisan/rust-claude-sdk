@@ -8,6 +8,8 @@ use crate::response::{Citation, ContentBlock};
 pub(crate) const BETA_FALLBACK_DEFAULT: &str = "server-side-fallback-2026-07-01";
 /// Beta header for the array form `fallbacks: [{"model": ...}]`.
 pub(crate) const BETA_FALLBACK_LIST: &str = "server-side-fallback-2026-06-01";
+/// Beta header for `output_config.task_budget`.
+pub(crate) const BETA_TASK_BUDGET: &str = "task-budgets-2026-03-13";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MessagesRequest {
@@ -99,6 +101,24 @@ impl MessagesRequest {
         self
     }
 
+    /// Sets `output_config.task_budget`: a token budget for the whole agentic loop that the
+    /// model sees and paces itself against (unlike `max_tokens`, which cuts it off). At least
+    /// 20,000. The client adds the beta header it needs. Leave `remaining` unset unless you
+    /// rewrite history between requests.
+    pub fn task_budget(mut self, total: u32) -> Self {
+        self.output_config.get_or_insert_with(OutputConfig::default).task_budget = Some(TaskBudget::tokens(total));
+        self
+    }
+
+    /// Structured outputs: the reply's text is JSON valid against `schema` (which needs
+    /// `additionalProperties: false` on its objects). Read it with `Message::json`. Cannot be
+    /// combined with citations. On models that reject forced `tool_choice` this replaces a
+    /// forced tool call made only to get JSON back.
+    pub fn json_schema(mut self, schema: Value) -> Self {
+        self.output_config.get_or_insert_with(OutputConfig::default).format = Some(serde_json::json!({"type": "json_schema", "schema": schema}));
+        self
+    }
+
     pub fn tool(mut self, tool: impl Into<ToolDefinition>) -> Self {
         self.tools.push(tool.into());
         self
@@ -125,16 +145,17 @@ impl MessagesRequest {
         self
     }
 
-    /// The `anthropic-beta` values this request needs: its own, then the one its
-    /// `fallbacks` form requires (unless already present), without duplicates.
+    /// The `anthropic-beta` values this request needs: its own, then the ones its
+    /// `fallbacks` form and task budget require (unless already present), without duplicates.
     pub fn beta_header_values(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let needed = match &self.fallbacks {
+        let fallback = match &self.fallbacks {
             Some(Fallbacks::Default) => Some(BETA_FALLBACK_DEFAULT),
             Some(Fallbacks::Models(_)) => Some(BETA_FALLBACK_LIST),
             None => None,
         };
-        for b in self.betas.iter().map(String::as_str).chain(needed) {
+        let budget = self.output_config.as_ref().and_then(|c| c.task_budget.as_ref()).map(|_| BETA_TASK_BUDGET);
+        for b in self.betas.iter().map(String::as_str).chain(fallback).chain(budget) {
             if !out.iter().any(|o| o == b) {
                 out.push(b.to_string());
             }
@@ -148,6 +169,8 @@ impl MessagesRequest {
 pub enum Role {
     User,
     Assistant,
+    /// A mid-conversation operator instruction (see `MessageParam::system`).
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -167,6 +190,14 @@ impl MessageParam {
 
     pub fn assistant(blocks: Vec<ContentBlockParam>) -> MessageParam {
         MessageParam { role: Role::Assistant, content: Content::Blocks(blocks) }
+    }
+
+    /// An operator instruction added mid-conversation, instead of editing the top-level
+    /// `system` (which would invalidate the cached history). It must follow a user turn and
+    /// be the last message or be followed by an assistant turn; never `messages[0]`. Not every
+    /// model accepts it (Claude Sonnet 5 does not).
+    pub fn system(text: impl Into<String>) -> MessageParam {
+        MessageParam { role: Role::System, content: Content::Text(text.into()) }
     }
 }
 
@@ -435,6 +466,25 @@ pub struct OutputConfig {
     /// Structured output format (cannot be combined with citations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,
+    /// Token budget for an agentic loop (beta; see `MessagesRequest::task_budget`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_budget: Option<TaskBudget>,
+}
+
+/// `output_config.task_budget`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename = "tokens")]
+pub struct TaskBudget {
+    pub total: u32,
+    /// What is left of `total`; the server tracks it unless history was rewritten.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u32>,
+}
+
+impl TaskBudget {
+    pub fn tokens(total: u32) -> TaskBudget {
+        TaskBudget { total, remaining: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,13 +507,33 @@ pub struct Tool {
     /// Loaded only when a tool search finds it (see `ToolSearchTool`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_loading: Option<bool>,
+    /// Stream the input as it is generated (see `Tool::eager_input_streaming`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eager_input_streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
 
 impl Tool {
     pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: Value) -> Tool {
-        Tool { name: name.into(), description: description.into(), input_schema, strict: None, defer_loading: None, cache_control: None }
+        Tool {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            strict: None,
+            defer_loading: None,
+            eager_input_streaming: None,
+            cache_control: None,
+        }
+    }
+
+    /// When streaming, large inputs arrive as they are generated instead of in one burst at
+    /// the end. The API then no longer validates the input: it may be cut short
+    /// (`max_tokens`) or invalid JSON, so check it before running the tool. Leave it off for
+    /// requests that are not streamed.
+    pub fn eager_input_streaming(mut self) -> Self {
+        self.eager_input_streaming = Some(true);
+        self
     }
 
     /// Inputs always validate against the schema (which needs `additionalProperties: false`).

@@ -210,6 +210,10 @@ impl Client {
         let mut betas: Vec<String> = Vec::new();
         let mut requests = requests.to_vec();
         for r in &mut requests {
+            self.check(&r.params).map_err(|e| match e {
+                Error::InvalidRequest(m) => Error::InvalidRequest(format!("{}: {m}", r.custom_id)),
+                e => e,
+            })?;
             r.params.stream = None;
             for b in r.params.beta_header_values() {
                 if !betas.contains(&b) {

@@ -14,7 +14,10 @@
 //! - server tools (web search, web fetch, code execution, tool search) with typed
 //!   definitions, result blocks, web search citations and `usage.server_tool_use`;
 //! - a tool-use loop (`Client::run_tools`) that runs your tools and resumes paused turns;
-//! - `POST /v1/messages/count_tokens`, Message Batches, the Files API and the Models API.
+//! - `POST /v1/messages/count_tokens`, Message Batches, the Files API and the Models API;
+//! - API version `2026-10-21` (`API_VERSION`): messages typed by role, API keys sent as
+//!   `Authorization: Bearer`, and requests checked against the version's rules before
+//!   sending (`MessagesRequest::validate`); `LEGACY_API_VERSION` keeps the old behaviour.
 //!
 //! ```no_run
 //! use rust_claude_sdk::{Client, ClientConfig, ContentBlockParam, MessageParam, MessagesRequest};
@@ -53,7 +56,7 @@ mod stream;
 mod tools;
 
 pub use batches::{BatchOutcome, BatchRequest, BatchResult, BatchResults, MessageBatch, ProcessingStatus, RequestCounts};
-pub use client::{CallOptions, Client, ClientConfig, Credential, API_VERSION, DEFAULT_BASE_URL};
+pub use client::{CallOptions, Client, ClientConfig, Credential, API_VERSION, DEFAULT_BASE_URL, LEGACY_API_VERSION};
 pub use error::{ApiErrorBody, Error};
 pub use files::FileMetadata;
 pub use models::Model;

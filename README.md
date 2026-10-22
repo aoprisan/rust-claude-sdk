@@ -100,6 +100,16 @@ println!("{:?} tokens of context, adaptive thinking: {}", opus.max_input_tokens,
 let page = client.list_models(&ListParams::default()).await?;
 ```
 
+### API version
+
+Requests go out with `anthropic-version: 2026-10-21` ([migration guide](https://platform.claude.com/docs/en/api/migration-2026-10-21)). On that version:
+
+- `temperature`, `top_p` and `top_k` are removed, a `document` block directly in an assistant message is rejected, and so is `citations` on text in a user message (`search_result` blocks included). `MessagesRequest::validate` checks these rules, and the client runs it before sending, so such a request fails with `Error::InvalidRequest` and is never sent.
+- `MessageParam` has one variant per role (`User`, `Assistant`, `System`). A system message holds text only. `role()` and `content()` read a message of any role.
+- An API key is sent as `Authorization: Bearer`. For a proxy or gateway that reads `x-api-key`, use `Credential::XApiKey`.
+
+To keep the old behaviour for a client, for example sampling with a lower `temperature` on a model that accepts it, set `api_version: LEGACY_API_VERSION.into()` in its `ClientConfig`. Requests on that version are not checked.
+
 ## Examples
 
 Runnable programs in [`examples/`](examples), each started with `ANTHROPIC_API_KEY=... cargo run --example <name>`:

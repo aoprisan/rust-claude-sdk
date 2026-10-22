@@ -105,8 +105,9 @@ async fn sends_the_documented_request_shape_and_headers() {
 
     let seen = server.seen.lock().unwrap();
     let (headers, body) = &seen[0];
-    assert_eq!(header(headers, "x-api-key"), Some(KEY));
-    assert_eq!(header(headers, "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(header(headers, "authorization"), Some(concat!("Bearer ", "sk-ant-test-SECRET")));
+    assert_eq!(header(headers, "x-api-key"), None);
+    assert_eq!(header(headers, "anthropic-version"), Some("2026-10-21"));
     assert_eq!(header(headers, "anthropic-beta"), Some("server-side-fallback-2026-07-01"));
     assert_eq!(header(headers, "content-type"), Some("application/json"));
     assert_eq!(
@@ -648,7 +649,7 @@ async fn files_upload_list_get_download_delete() {
     );
     let seen = server.seen.lock().unwrap();
     assert!(header(&seen[0].0, "content-type").unwrap().starts_with("multipart/form-data; boundary="));
-    assert_eq!(header(&seen[0].0, "x-api-key"), Some(KEY));
+    assert_eq!(header(&seen[0].0, "authorization"), Some(concat!("Bearer ", "sk-ant-test-SECRET")));
     let upload = &calls[0].2;
     assert!(upload.contains(r#"Content-Disposition: form-data; name="file"; filename="ghid.pdf""#), "{upload}");
     assert!(upload.contains("Content-Type: application/pdf\r\n\r\n%PDF\r\n"), "{upload}");
@@ -779,4 +780,79 @@ async fn a_tool_loop_cut_short_resumes_with_the_pending_calls() {
     assert_eq!(run.requests, 1);
     let sent = &server.seen.lock().unwrap()[1].1["messages"];
     assert_eq!(sent[2], json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "RO1 ok"}]}));
+}
+
+#[tokio::test]
+async fn api_keys_go_as_bearer_without_the_oauth_beta_or_as_x_api_key_on_request() {
+    let (url, server) = serve(vec![reply(200, CITED)]).await;
+    client(&url, 0).create(&MessagesRequest::new("claude-opus-5-5", 64).user("salut")).await.unwrap();
+    let c = Client::new(ClientConfig { base_url: url.clone(), ..ClientConfig::new(Credential::XApiKey(KEY.into())) }).unwrap();
+    c.create(&MessagesRequest::new("claude-opus-5-5", 64).user("salut")).await.unwrap();
+    assert!(!format!("{c:?}").contains(KEY));
+
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(header(&seen[0].0, "anthropic-beta"), None);
+    assert_eq!(header(&seen[1].0, "x-api-key"), Some(KEY));
+    assert_eq!(header(&seen[1].0, "authorization"), None);
+    assert_eq!(header(&seen[1].0, "anthropic-beta"), None);
+}
+
+#[tokio::test]
+async fn requests_2026_10_21_rejects_are_not_sent() {
+    let (url, server) = serve(vec![reply(200, CITED)]).await;
+    let c = client(&url, 0);
+    let cited = ContentBlockParam::Text {
+        text: "30 de zile".into(),
+        citations: Some(vec![Citation::Other(json!({"type": "char_location", "cited_text": "30 de zile"}))]),
+        cache_control: None,
+    };
+    let search_result = json!({"type": "search_result", "source": "https://mai.gov.ro", "title": "Ghid", "content": [
+        {"type": "text", "text": "30 de zile", "citations": [{"type": "char_location", "cited_text": "30"}]}
+    ]});
+    let bad = [
+        MessagesRequest::new("claude-sonnet-4-6", 64).user("salut").param("temperature", 0.2),
+        MessagesRequest::new("claude-sonnet-4-6", 64).user("salut").param("top_k", 5),
+        MessagesRequest::new("claude-opus-5-5", 64)
+            .user("salut")
+            .message(MessageParam::assistant(vec![ContentBlockParam::text_document("Termenul este de 30 de zile.", "Ghid CI")])),
+        MessagesRequest::new("claude-opus-5-5", 64).message(MessageParam::user(vec![cited.clone()])),
+        MessagesRequest::new("claude-opus-5-5", 64).message(MessageParam::user(vec![ContentBlockParam::ToolResult {
+            tool_use_id: "toolu_1".into(),
+            content: rust_claude_sdk::ToolResultContent::Blocks(vec![ContentBlockParam::Raw(search_result)]),
+            is_error: None,
+            cache_control: None,
+        }])),
+    ];
+    for request in &bad {
+        let err = c.create(request).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+        assert!(matches!(c.count_tokens(request).await.unwrap_err(), Error::InvalidRequest(_)));
+    }
+    let err = c.create_batch(&[BatchRequest::new("r1", bad[0].clone())]).await.unwrap_err();
+    assert!(err.to_string().contains("r1: `temperature`"), "{err}");
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+
+    // Still accepted: citations on echoed assistant text, documents in user turns, citations enabled.
+    let ok = grounded_request().message(MessageParam::assistant(vec![cited])).user("Mulțumesc");
+    c.create(&ok).await.unwrap();
+
+    // On the legacy version nothing is checked and the old header goes out.
+    let legacy = Client::new(ClientConfig { base_url: url, api_version: rust_claude_sdk::LEGACY_API_VERSION.into(), ..ClientConfig::api_key(KEY) }).unwrap();
+    legacy.create(&bad[0]).await.unwrap();
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(header(&seen[1].0, "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(seen[1].1["temperature"], json!(0.2));
+}
+
+#[test]
+fn messages_are_typed_by_role() {
+    use rust_claude_sdk::{Content, Role, System, SystemBlock};
+    let system = MessageParam::System { content: System::Blocks(vec![SystemBlock { text: "Be brief.".into(), cache_control: None }]) };
+    assert_eq!(serde_json::to_value(&system).unwrap(), json!({"role": "system", "content": [{"type": "text", "text": "Be brief."}]}));
+    assert_eq!(system.role(), Role::System);
+    assert!(system.content().is_none());
+    let user = MessageParam::user_text("salut");
+    assert_eq!(user.role(), Role::User);
+    assert_eq!(user.content(), Some(&Content::Text("salut".into())));
+    assert_eq!(serde_json::to_value(MessageParam::assistant(vec![])).unwrap(), json!({"role": "assistant", "content": []}));
 }

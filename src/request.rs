@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::error::Error;
 use crate::response::{Citation, ContentBlock};
 
 /// Beta header for `fallbacks: "default"`.
@@ -145,6 +146,33 @@ impl MessagesRequest {
         self
     }
 
+    /// Checks the rules API version `2026-10-21` added, which the client applies before
+    /// sending on that version: no `temperature`, `top_p` or `top_k` (they were removed),
+    /// no `document` block directly in an assistant message (send documents in user
+    /// messages), and no `citations` on text in a user message, `search_result` blocks
+    /// included (citations stay accepted on echoed assistant text).
+    pub fn validate(&self) -> Result<(), Error> {
+        if let Some(p) = ["temperature", "top_p", "top_k"].into_iter().find(|p| self.extra.contains_key(*p)) {
+            return Err(Error::InvalidRequest(format!("`{p}` was removed in API version 2026-10-21")));
+        }
+        for (i, message) in self.messages.iter().enumerate() {
+            let blocks = match message {
+                MessageParam::User { content: Content::Blocks(b) } | MessageParam::Assistant { content: Content::Blocks(b) } => b,
+                _ => continue,
+            };
+            let role = message.role();
+            for block in blocks {
+                if role == Role::Assistant && block.kind() == Some("document") {
+                    return Err(Error::InvalidRequest(format!("messages[{i}]: send `document` blocks in user messages, not assistant ones")));
+                }
+                if role == Role::User && block.has_citations() {
+                    return Err(Error::InvalidRequest(format!("messages[{i}]: a user message cannot carry `citations` on its text")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The `anthropic-beta` values this request needs: its own, then the ones its
     /// `fallbacks` form and task budget require (unless already present), without duplicates.
     pub fn beta_header_values(&self) -> Vec<String> {
@@ -173,23 +201,33 @@ pub enum Role {
     System,
 }
 
+/// One message of the conversation, typed by its role (serialised with its `role`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct MessageParam {
-    pub role: Role,
-    pub content: Content,
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum MessageParam {
+    User {
+        content: Content,
+    },
+    Assistant {
+        content: Content,
+    },
+    /// A mid-conversation operator instruction: text only (see `MessageParam::system`).
+    System {
+        content: System,
+    },
 }
 
 impl MessageParam {
     pub fn user_text(text: impl Into<String>) -> MessageParam {
-        MessageParam { role: Role::User, content: Content::Text(text.into()) }
+        MessageParam::User { content: Content::Text(text.into()) }
     }
 
     pub fn user(blocks: Vec<ContentBlockParam>) -> MessageParam {
-        MessageParam { role: Role::User, content: Content::Blocks(blocks) }
+        MessageParam::User { content: Content::Blocks(blocks) }
     }
 
     pub fn assistant(blocks: Vec<ContentBlockParam>) -> MessageParam {
-        MessageParam { role: Role::Assistant, content: Content::Blocks(blocks) }
+        MessageParam::Assistant { content: Content::Blocks(blocks) }
     }
 
     /// An operator instruction added mid-conversation, instead of editing the top-level
@@ -197,7 +235,23 @@ impl MessageParam {
     /// be the last message or be followed by an assistant turn; never `messages[0]`. Not every
     /// model accepts it (Claude Sonnet 5 does not).
     pub fn system(text: impl Into<String>) -> MessageParam {
-        MessageParam { role: Role::System, content: Content::Text(text.into()) }
+        MessageParam::System { content: System::Text(text.into()) }
+    }
+
+    pub fn role(&self) -> Role {
+        match self {
+            MessageParam::User { .. } => Role::User,
+            MessageParam::Assistant { .. } => Role::Assistant,
+            MessageParam::System { .. } => Role::System,
+        }
+    }
+
+    /// The content of a user or assistant message; `None` for a system message.
+    pub fn content(&self) -> Option<&Content> {
+        match self {
+            MessageParam::User { content } | MessageParam::Assistant { content } => Some(content),
+            MessageParam::System { .. } => None,
+        }
     }
 }
 
@@ -326,6 +380,26 @@ impl ContentBlockParam {
         }
     }
 
+    /// The block's `type`.
+    fn kind(&self) -> Option<&str> {
+        match self {
+            ContentBlockParam::Document { .. } => Some("document"),
+            ContentBlockParam::Raw(v) => v.get("type").and_then(Value::as_str),
+            _ => None,
+        }
+    }
+
+    /// Whether this block, or a text block inside it (a tool result's content, a search
+    /// result's content), carries a non-empty `citations` array.
+    fn has_citations(&self) -> bool {
+        match self {
+            ContentBlockParam::Text { citations, .. } => citations.as_ref().is_some_and(|c| !c.is_empty()),
+            ContentBlockParam::ToolResult { content: ToolResultContent::Blocks(blocks), .. } => blocks.iter().any(ContentBlockParam::has_citations),
+            ContentBlockParam::Raw(v) => raw_has_citations(v),
+            _ => false,
+        }
+    }
+
     /// Enables citations on a document; no effect on other blocks.
     pub fn with_citations(mut self) -> Self {
         if let ContentBlockParam::Document { citations, .. } = &mut self {
@@ -367,6 +441,16 @@ impl From<ContentBlock> for ContentBlockParam {
             ContentBlock::ToolUse { id, name, input } => ContentBlockParam::ToolUse { id, name, input },
             other => ContentBlockParam::Raw(serde_json::to_value(&other).unwrap_or(Value::Null)),
         }
+    }
+}
+
+/// A raw `text` block with non-empty `citations`, or a `search_result` or `tool_result`
+/// whose content holds one.
+fn raw_has_citations(v: &Value) -> bool {
+    match v.get("type").and_then(Value::as_str) {
+        Some("text") => v.get("citations").and_then(Value::as_array).is_some_and(|c| !c.is_empty()),
+        Some("search_result" | "tool_result") => v.get("content").and_then(Value::as_array).is_some_and(|c| c.iter().any(raw_has_citations)),
+        _ => false,
     }
 }
 

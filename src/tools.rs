@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::client::{CallOptions, Client};
 use crate::error::Error;
-use crate::request::{Content, ContentBlockParam, MessageParam, MessagesRequest, Role, ToolResultContent};
+use crate::request::{Content, ContentBlockParam, MessageParam, MessagesRequest, ToolResultContent};
 use crate::response::{Message, StopReason, Usage};
 
 /// One tool call the model asked for.
@@ -164,8 +164,8 @@ impl Client {
 
 /// The tool calls of an assistant turn, which then still need their results.
 fn unanswered_calls(turn: &MessageParam) -> Vec<ToolCall> {
-    match (&turn.role, &turn.content) {
-        (Role::Assistant, Content::Blocks(blocks)) => blocks
+    match turn {
+        MessageParam::Assistant { content: Content::Blocks(blocks) } => blocks
             .iter()
             .filter_map(|b| match b {
                 ContentBlockParam::ToolUse { id, name, input } => Some(ToolCall { id: id.clone(), name: name.clone(), input: input.clone() }),

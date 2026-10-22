@@ -15,15 +15,20 @@ use crate::response::Message;
 use crate::stream::MessageStream;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-/// Value of the `anthropic-version` header.
-pub const API_VERSION: &str = "2023-06-01";
+/// Default value of the `anthropic-version` header (see `ClientConfig::api_version`).
+pub const API_VERSION: &str = "2026-10-21";
+/// The previous API version, for requests that still need its behaviour (e.g. sampling
+/// parameters on models that accept non-default values).
+pub const LEGACY_API_VERSION: &str = "2023-06-01";
 /// Beta value an OAuth access token needs.
 const BETA_OAUTH: &str = "oauth-2025-04-20";
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
-    /// Sent as `x-api-key`.
+    /// An API key, sent as `Authorization: Bearer` (the API accepts a key in either header).
     ApiKey(String),
+    /// An API key sent as `x-api-key`, for a proxy or gateway that reads that header.
+    XApiKey(String),
     /// An OAuth access token, sent as `Authorization: Bearer`.
     Bearer(String),
 }
@@ -32,6 +37,7 @@ impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Credential::ApiKey(_) => f.write_str("ApiKey(..)"),
+            Credential::XApiKey(_) => f.write_str("XApiKey(..)"),
             Credential::Bearer(_) => f.write_str("Bearer(..)"),
         }
     }
@@ -49,6 +55,9 @@ pub struct ClientConfig {
     pub max_retries: u32,
     /// `anthropic-beta` values sent with every request.
     pub betas: Vec<String>,
+    /// The `anthropic-version` header, `API_VERSION` by default. From `2026-10-21` on,
+    /// Messages requests are checked with `MessagesRequest::validate` before they are sent.
+    pub api_version: String,
 }
 
 impl ClientConfig {
@@ -60,6 +69,7 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(10),
             max_retries: 2,
             betas: Vec::new(),
+            api_version: API_VERSION.into(),
         }
     }
 
@@ -67,8 +77,8 @@ impl ClientConfig {
         ClientConfig::new(Credential::ApiKey(key.into()))
     }
 
-    /// `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN` (a bearer token), plus
-    /// `ANTHROPIC_BASE_URL` when set, as the official SDKs read them.
+    /// One credential, `ANTHROPIC_API_KEY` or else `ANTHROPIC_AUTH_TOKEN` (a bearer token),
+    /// plus `ANTHROPIC_BASE_URL` when set, as the official SDKs read them.
     pub fn from_env() -> Option<ClientConfig> {
         let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let credential = var("ANTHROPIC_API_KEY").map(Credential::ApiKey).or_else(|| var("ANTHROPIC_AUTH_TOKEN").map(Credential::Bearer))?;
@@ -178,6 +188,7 @@ impl Client {
     }
 
     pub async fn create_with(&self, request: &MessagesRequest, options: CallOptions) -> Result<Message, Error> {
+        self.check(request)?;
         let mut body = request.clone();
         body.stream = None;
         let json = to_json(&body)?;
@@ -191,6 +202,7 @@ impl Client {
     }
 
     pub async fn stream_with(&self, request: &MessagesRequest, options: CallOptions) -> Result<MessageStream, Error> {
+        self.check(request)?;
         let mut body = request.clone();
         body.stream = Some(true);
         let json = to_json(&body)?;
@@ -206,6 +218,7 @@ impl Client {
 
     /// `POST /v1/messages/count_tokens`: input tokens of the request's prompt on its model.
     pub async fn count_tokens(&self, request: &MessagesRequest) -> Result<u64, Error> {
+        self.check(request)?;
         let body = CountTokensBody {
             model: &request.model,
             messages: &request.messages,
@@ -218,6 +231,14 @@ impl Client {
         let res: CountTokensResponse =
             self.call(Method::POST, &["v1", "messages", "count_tokens"], &[], Payload::Json(&json), &request.betas, CallOptions::default()).await?;
         Ok(res.input_tokens)
+    }
+
+    /// Rejects, before sending, a request the configured API version would reject.
+    pub(crate) fn check(&self, request: &MessagesRequest) -> Result<(), Error> {
+        if self.config.api_version.as_str() >= API_VERSION {
+            request.validate()?;
+        }
+        Ok(())
     }
 
     /// One request with retries, its body decoded as JSON.
@@ -308,13 +329,13 @@ impl Client {
         betas: &[String],
         options: CallOptions,
     ) -> Result<reqwest::Response, Failure> {
-        let mut req = self.http.request(method, url).header("anthropic-version", API_VERSION);
+        let mut req = self.http.request(method, url).header("anthropic-version", &self.config.api_version);
         if !query.is_empty() {
             req = req.query(query);
         }
         req = match &self.config.credential {
-            Credential::ApiKey(k) => req.header("x-api-key", k),
-            Credential::Bearer(t) => req.bearer_auth(t),
+            Credential::ApiKey(k) | Credential::Bearer(k) => req.bearer_auth(k),
+            Credential::XApiKey(k) => req.header("x-api-key", k),
         };
         let oauth = matches!(self.config.credential, Credential::Bearer(_)).then_some(BETA_OAUTH);
         let mut all: Vec<&str> = Vec::new();

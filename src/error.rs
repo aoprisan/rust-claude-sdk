@@ -25,6 +25,9 @@ pub enum Error {
     Deadline,
     #[error("invalid configuration: {0}")]
     Config(String),
+    /// The request breaks a rule of the configured API version; it was not sent.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 impl Error {
